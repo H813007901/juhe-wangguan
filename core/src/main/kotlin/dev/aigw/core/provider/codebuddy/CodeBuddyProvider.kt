@@ -32,7 +32,6 @@ import dev.aigw.core.util.firstLong
 import dev.aigw.core.util.firstString
 import dev.aigw.core.util.jwtClaim
 import dev.aigw.core.util.objOrNull
-import dev.aigw.core.util.str
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
@@ -211,301 +210,6 @@ class CodeBuddyProvider(
             ACTION_CHECKIN -> checkin(account)
             ACTION_TASKS -> growth(account)
             else -> ProviderActionResult.unsupported(action)
-        }
-    }
-
-    /**
-     * 成长中心一键领取（WorkBuddy 的「任务」就在这里）。
-     *
-     * 顺序按官方客户端的行为链：
-     *   签到日历 → 新手礼包 / 补偿 → 领养 Buddy → 连登档位兑奖 → 抽奖
-     *   → 领旅行礼物 / 派 Buddy 出发 → 领任务 → 开盲盒 → 开学季
-     *
-     * 各步单独容错：某一步的业务拒绝（活动未开、无配额、条件未达）不该让其它步失败。
-     */
-    private fun growth(account: ProviderAccount): ProviderActionResult {
-        val credential = parse(account) ?: return ProviderActionResult.failure("凭证无法解析")
-        val base = "${chatBase(credential)}$PATH_GROWTH"
-        val headers = billingHeaders(credential)
-        val parts = ArrayList<String>()
-
-        claimGiftAndCompensation(credential, base, headers, parts)
-        adoptBuddy(credential, base, headers, parts)
-        redeemStreak(credential, base, headers, parts)
-        drawLottery(credential, base, headers, parts)
-        claimTravel(credential, base, headers, parts)
-        claimTasks(credential, base, headers, parts)
-        openBlindBox(credential, base, headers, parts)
-        claimSchoolSeason(credential, base, headers, parts)
-
-        return ProviderActionResult.success(
-            if (parts.isEmpty()) "成长中心没有可领取的内容" else parts.joinToString("；"),
-        )
-    }
-
-    /** 新手礼包与补偿：两个独立的一次性领取，各自容错。 */
-    private fun claimGiftAndCompensation(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        val billingRoot = chatBase(credential)
-        for ((path, label) in listOf(
-            "/billing/meter/claim-gift" to "新手礼包",
-            "/billing/meter/claim-compensation" to "补偿",
-        )) {
-            runCatching {
-                val (status, body) = postJson("${billingRoot}$path", credential, "{}", headers)
-                if (status !in 200..299) return@runCatching
-                val credit = jsonOf(body)?.firstNumber("credit", "reward_credit", "amount")
-                if (credit != null) parts.add("$label +$credit")
-            }
-        }
-    }
-
-    /**
-     * 领养 Buddy：先报「完成任务」，再同意协议，最后触发领养。
-     *
-     * 三步有先后依赖，任一步失败就停（上游会以 `first_buddy task not completed yet` 拒绝）。
-     * 注意路径**没有 /v2 前缀**（与其它成长接口不同）。
-     */
-    private fun adoptBuddy(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        val root = chatBase(credential)
-        runCatching {
-            val (infoStatus, infoBody) = getJson("$root$PATH_GROWTH/buddy/info", headers)
-            if (infoStatus !in 200..299) return@runCatching
-            val adopted = jsonOf(infoBody)?.let { obj ->
-                val buddy = obj.objOrNull("buddy") ?: obj.objOrNull("data")?.objOrNull("buddy")
-                buddy != null && buddy.entrySet().isNotEmpty()
-            } ?: false
-            if (adopted) return@runCatching
-
-            val agree = "${chatBase(credential)}/activity/growth/buddy/agreement"
-            runCatching { postJson(agree, credential, """{"agree":true}""", headers) }
-            val first = "${chatBase(credential)}/activity/growth/buddy/first"
-            val (status, body) = postJson(first, credential, "{}", headers)
-            if (status in 200..299) {
-                val credit = jsonOf(body)?.firstNumber("credit", "reward_credit")
-                parts.add(if (credit != null) "领养 Buddy +$credit" else "领养 Buddy")
-            }
-        }
-    }
-
-    /**
-     * 连登档位兑奖：查连登状态，对**已达标但未领取**的档位调 redeem。
-     *
-     * 档位固定 `7d` / `14d` / `28d`；每次请求要带一个全新的小写 UUIDv4 作为幂等键。
-     */
-    private fun redeemStreak(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        runCatching {
-            val root = chatBase(credential)
-            val (status, body) = getJson("$root/activity/growth/streak", headers)
-            if (status !in 200..299) return@runCatching
-            val obj = jsonOf(body) ?: return@runCatching
-            val entitle = obj.objOrNull("redemption_status") ?: obj.objOrNull("data")?.objOrNull("redemption_status")
-            for (tier in listOf("7d", "14d", "28d")) {
-                val state = entitle?.str("tier_${tier}_status").orEmpty().lowercase()
-                // 已领过 / 未达标都跳过；只处理明确可领的
-                if (state.isEmpty() || state == "claimed" || state == "redeemed" || state == "false") continue
-                if (state != "true" && state != "available" && state != "claimable") continue
-                val (rs, _) = postJson("$root/activity/growth/redeem", credential, """{"tier":"$tier","client_token":"${uuid4()}"}""", headers)
-                if (rs in 200..299) parts.add("连登 $tier 兑奖")
-            }
-        }
-    }
-
-    /** 抽奖：先查次数，有剩余就抽（每次全新 client_token）。 */
-    private fun drawLottery(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        runCatching {
-            val root = chatBase(credential)
-            val (status, body) = getJson("$root/activity/growth/lottery/summary", headers)
-            if (status !in 200..299) return@runCatching
-            val chances = jsonOf(body)?.firstNumber("chances", "chance", "count") ?: return@runCatching
-            if (chances <= 0) return@runCatching
-            val draws = minOf(chances.toInt(), MAX_LOTTERY_DRAWS)
-            repeat(draws) {
-                val (rs, rb) = postJson(
-                    "$root/activity/growth/lottery/draw",
-                    credential,
-                    """{"client_token":"${uuid4()}"}""",
-                    headers,
-                )
-                if (rs in 200..299) {
-                    val prize = jsonOf(rb)?.firstString("prize_code").orEmpty()
-                    parts.add(if (prize.isEmpty()) "抽奖" else "抽奖 $prize")
-                }
-            }
-        }
-    }
-
-    /** 开学季：活动在期时领任务奖、再用获得的机会抽转盘。 */
-    private fun claimSchoolSeason(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        runCatching {
-            val root = chatBase(credential)
-            val (status, body) = getJson("$root/portal/activity/school/tasks", headers)
-            if (status !in 200..299) return@runCatching
-            val obj = jsonOf(body) ?: return@runCatching
-            val payload = obj.objOrNull("data") ?: obj
-            if (payload.get("in_period")?.asBoolean != true) return@runCatching
-            payload.arrayOrNull("tasks")?.forEach { element ->
-                val task = runCatching { element.asJsonObject }.getOrNull() ?: return@forEach
-                val code = task.firstString("task_code")
-                if (code.isEmpty()) return@forEach
-                val done = task.objOrNull("progress")?.let { p ->
-                    val cur = p.firstNumber("current", "progress") ?: 0.0
-                    val target = p.firstNumber("target", "target_count") ?: 1.0
-                    cur >= target && target > 0
-                } ?: false
-                val st = task.firstString("status").lowercase()
-                if (!done || st == "claimed" || st == "received") return@forEach
-                val (rs, _) = postJson("$root/portal/activity/school/tasks/$code/claim", credential, "{}", headers)
-                if (rs in 200..299) parts.add("开学季任务 $code")
-            }
-            // 有抽奖机会就转一次
-            val (cs, cb) = getJson("$root/portal/activity/school/config", headers)
-            if (cs in 200..299) {
-                val balance = jsonOf(cb)?.let { o ->
-                    (o.objOrNull("chance") ?: o.objOrNull("data")?.objOrNull("chance"))?.let {
-                        it.firstNumber("balance", "count")
-                    }
-                } ?: 0.0
-                if (balance > 0) {
-                    val (ws, wb) = postJson(
-                        "$root/portal/activity/school/wheel/draw",
-                        credential,
-                        """{"draw_uuid":"${uuid4()}"}""",
-                        headers,
-                    )
-                    if (ws in 200..299) {
-                        val prize = jsonOf(wb)?.firstString("prize_code").orEmpty()
-                        parts.add(if (prize.isEmpty()) "开学季转盘" else "开学季转盘 $prize")
-                    }
-                }
-            }
-        }
-    }
-
-    /** 旅行：已到达先领礼物，空闲则派 Buddy 出发。 */
-    private fun claimTravel(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        runCatching {
-            val (status, body) = getJson("$base/buddy/travel/status", headers)
-            if (status !in 200..299) return@runCatching
-            val obj = jsonOf(body) ?: return@runCatching
-            val state = obj.firstString("state")
-            val dailyLimit = obj.get("daily_limit_reached")?.asBoolean ?: false
-            when {
-                state == "arrived" -> {
-                    val recordId = obj.firstString("record_id")
-                    if (recordId.isEmpty()) return@runCatching
-                    val payload = JsonObject().apply { addProperty("record_id", recordId) }.toString()
-                    val (code, text) = postJson("$base/buddy/travel/claim", credential, payload, headers)
-                    if (code in 200..299) {
-                        val credit = jsonOf(text)?.firstLong("reward_credit") ?: 0L
-                        parts.add(if (credit > 0) "旅行礼物 +$credit" else "已领旅行礼物")
-                    }
-                }
-                state == "idle" && !dailyLimit -> {
-                    val (cfgCode, cfgBody) = getJson("$base/buddy/travel/config", headers)
-                    if (cfgCode !in 200..299) return@runCatching
-                    val location = jsonOf(cfgBody)?.arrayOrNull("locations")?.firstOrNull()
-                        ?.let { runCatching { it.asJsonObject }.getOrNull() } ?: return@runCatching
-                    val locationId = location.firstString("id")
-                    if (locationId.isEmpty()) return@runCatching
-                    val payload = JsonObject().apply { addProperty("location_id", locationId) }.toString()
-                    val (code, text) = postJson("$base/buddy/travel/depart", credential, payload, headers)
-                    if (code in 200..299) {
-                        val name = jsonOf(text)?.objOrNull("location")?.firstString("name").orEmpty()
-                        parts.add(if (name.isEmpty()) "已派 Buddy 出发" else "派 Buddy 去$name")
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * 任务：未领取的先接单（进度从接单那刻才开始计），已接单且达标的领奖。
-     */
-    private fun claimTasks(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        runCatching {
-            val (status, body) = getJson("$base/tasks", headers)
-            if (status !in 200..299) return@runCatching
-            val tasks = jsonOf(body)?.arrayOrNull("tasks") ?: return@runCatching
-            for (element in tasks) {
-                val task = runCatching { element.asJsonObject }.getOrNull() ?: continue
-                if (task.get("locked")?.asBoolean == true) continue
-                val acceptStatus = task.firstString("accept_status")
-                if (acceptStatus == "claimed") continue
-
-                val progress = task.objOrNull("progress")
-                val target = progress?.firstLong("target")?.takeIf { it > 0 } ?: 1L
-                val current = progress?.firstLong("current") ?: 0L
-                val done = current >= target
-                // 已接单但还没做完：等用户完成，别重复提交
-                if (!done && acceptStatus.isNotEmpty()) continue
-                val claiming = done && acceptStatus.isNotEmpty()
-
-                val taskCode = task.firstString("task_code")
-                if (taskCode.isEmpty()) continue
-                val payload = JsonObject().apply { addProperty("task_code", taskCode) }.toString()
-                val (code, text) = postJson("$base/tasks/accept", credential, payload, headers)
-                if (code !in 200..299) continue
-                val title = task.firstString("title").ifEmpty { taskCode }
-                val credit = jsonOf(text)?.firstLong("credit") ?: 0L
-                parts.add(
-                    if (claiming && credit > 0) "领任务奖「$title」+$credit" else "领取任务「$title」",
-                )
-            }
-        }
-    }
-
-    /** 盲盒：有配额才开。 */
-    private fun openBlindBox(
-        credential: Credential,
-        base: String,
-        headers: Map<String, String>,
-        parts: MutableList<String>,
-    ) {
-        runCatching {
-            val (status, body) = getJson("$base/buddy/quota", headers)
-            if (status !in 200..299) return@runCatching
-            val quota = jsonOf(body) ?: return@runCatching
-            val remain = quota.firstLong("remaining", "quota", "count", "balance", "left")
-            if (remain <= 0) return@runCatching
-            val (code, text) = postJson("$base/buddy/open", credential, "{}", headers)
-            if (code !in 200..299) return@runCatching
-            val credit = jsonOf(text)?.firstLong("credit", "reward_credit") ?: 0L
-            parts.add(if (credit > 0) "开盲盒 +$credit" else "已开盲盒")
         }
     }
 
@@ -808,7 +512,7 @@ class CodeBuddyProvider(
         return HttpSupport.open(url, method, merged, body, CONNECT_TIMEOUT_MS, readTimeoutMs, allowCompression)
     }
 
-    private fun postJson(
+    internal fun postJson(
         url: String,
         credential: Credential?,
         body: String?,
@@ -822,7 +526,7 @@ class CodeBuddyProvider(
         }
     }
 
-    private fun getJson(
+    internal fun getJson(
         url: String,
         headers: Map<String, String> = emptyMap(),
         readTimeoutMs: Int = READ_TIMEOUT_MS,
@@ -865,7 +569,7 @@ class CodeBuddyProvider(
         putAll(endpoint(credential).extraHeaders)
     }
 
-    private fun billingHeaders(credential: Credential): Map<String, String> = buildMap {
+    internal fun billingHeaders(credential: Credential): Map<String, String> = buildMap {
         put("Authorization", "Bearer ${credential.accessToken}")
         put("Accept", "application/json")
         put("Content-Type", "application/json")
@@ -949,13 +653,13 @@ class CodeBuddyProvider(
     /** 该凭证的区域端点；所有按区域分叉的 host / 路径 / 头都从这里取。 */
     private fun endpoint(credential: Credential?): Endpoint = endpointOf(regionOf(credential))
 
-    private fun chatBase(credential: Credential?): String = endpoint(credential).chatBase
+    internal fun chatBase(credential: Credential?): String = endpoint(credential).chatBase
 
     private fun billingBase(credential: Credential?): String = endpoint(credential).billingBase
 
     private fun originFor(credential: Credential?): String = endpoint(credential).origin
 
-    private fun parse(account: ProviderAccount): Credential? {
+    internal fun parse(account: ProviderAccount): Credential? {
         val obj = runCatching { JsonParser.parseString(account.secret).asJsonObject }.getOrNull() ?: return null
         return credentialOf(obj).takeIf { it.accessToken.isNotEmpty() }
     }
@@ -1033,7 +737,7 @@ class CodeBuddyProvider(
         runCatching { JsonParser.parseString(body).asJsonObject.get("stream")?.asBoolean ?: false }
             .getOrDefault(false)
 
-    private data class Credential(
+    internal data class Credential(
         val accessToken: String,
         val refreshToken: String,
         val expiresAt: Long,
@@ -1154,167 +858,4 @@ class CodeBuddyProvider(
          *  用对话那套 300s 会被网关侧的 20s 聚合超时盖掉，看不到真实错误。 */
         private const val MODELS_READ_TIMEOUT_MS = 15_000
     }
-}
-
-/**
- * 改写发往 CodeBuddy 的请求体：
- * 1. 强制 `stream:true`（上游拒绝非流式）；
- * 2. `tool_choice` 归一化成字符串（上游该字段是 string，对象形式会 400）；
- * 3. 消息形状对齐上游要求（首条必须 system、`developer` 改叫 `system`）
- *    与 `max_completion_tokens` → `max_tokens`；
- * 4. 去掉上游会拦的特征文本（Claude Code / Codex CLI 的系统提示词片段）。
- */
-internal fun prepareCodeBuddyBody(src: String): String {
-    val obj = runCatching { JsonParser.parseString(src).asJsonObject }.getOrNull() ?: return src
-    obj.addProperty("stream", true)
-    normalizeCodeBuddyToolChoice(obj)
-    normalizeCodeBuddyMessages(obj)
-    normalizeCodeBuddyMaxTokens(obj)
-    unflagCodeBuddyMessages(obj)
-    return obj.toString()
-}
-
-/** 上游不认 `max_completion_tokens`（新版 OpenAI 客户端会发它），只认 `max_tokens`。 */
-private fun normalizeCodeBuddyMaxTokens(obj: JsonObject) {
-    val legacy = obj.get("max_completion_tokens") ?: return
-    obj.remove("max_completion_tokens")
-    if (!obj.has("max_tokens")) obj.add("max_tokens", legacy)
-}
-
-/** 缺 system 消息时补的默认提示词（与公开实现一致的中性文本，能过上游的内容检查）。 */
-private const val DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
-
-/**
- * 消息形状归一。
- *
- * 上游把「首条消息不是 system」当成错误拒绝（HTTP 400 code=11128
- * "first message is not system prompt"），所以缺就补一条；
- * 只要不是 system 的 `developer` 角色也改叫 `system`。
- */
-private fun normalizeCodeBuddyMessages(obj: JsonObject) {
-    val messages = obj.arrayOrNull("messages") ?: return
-    for (element in messages) {
-        val message = runCatching { element.asJsonObject }.getOrNull() ?: continue
-        if (message.get("role")?.asString == "developer") message.addProperty("role", "system")
-    }
-    val first = messages.firstOrNull()?.let { runCatching { it.asJsonObject }.getOrNull() }
-    if (first != null && first.get("role")?.asString == "system") return
-    val withSystem = JsonArray()
-    withSystem.add(
-        JsonObject().apply {
-            addProperty("role", "system")
-            addProperty("content", DEFAULT_SYSTEM_PROMPT)
-        },
-    )
-    for (element in messages) withSystem.add(element)
-    obj.add("messages", withSystem)
-}
-
-/**
- * 上游会以「Illegal API invocation from an unapproved channel」拦下带第三方 CLI 特征文本的请求
- * （Claude Code / Codex CLI 的系统提示词片段），这几处按等义写法替换即可通过。
- *
- * 替换表来自公开实现 magpie（用真实客户端逐词实测得出），两套发行版都适用。
- */
-private val FLAGGED_TEXT = listOf(
-    Regex("x-anthropic-billing-header:[^\\n]*\\n?", RegexOption.IGNORE_CASE) to "",
-    Regex("You are Claude Code, Anthropic['’]s official CLI for Claude", RegexOption.IGNORE_CASE) to
-        "You are Claude Code, Anthropic's CLI for Claude",
-    Regex("Main branch \\(you will usually use this for PRs\\)", RegexOption.IGNORE_CASE) to
-        "Main branch (usually the base for PRs)",
-    Regex("(?<!the )Codex CLI is an open source project led by OpenAI\\.", RegexOption.IGNORE_CASE) to
-        "The Codex CLI is an open source project led by OpenAI.",
-)
-
-/** 去掉消息里的敏感特征文本；字符串内容与多模态 parts 都处理。 */
-private fun unflagCodeBuddyMessages(obj: JsonObject) {
-    val messages = obj.arrayOrNull("messages") ?: return
-    for (element in messages) {
-        val message = runCatching { element.asJsonObject }.getOrNull() ?: continue
-        val content = message.get("content") ?: continue
-        when {
-            content.isJsonPrimitive && content.asJsonPrimitive.isString ->
-                message.addProperty("content", unflagText(content.asString))
-            content.isJsonArray -> {
-                for (part in content.asJsonArray) {
-                    val partObj = runCatching { part.asJsonObject }.getOrNull() ?: continue
-                    val text = partObj.get("text") ?: continue
-                    if (text.isJsonPrimitive && text.asJsonPrimitive.isString) {
-                        partObj.addProperty("text", unflagText(text.asString))
-                    }
-                }
-            }
-        }
-    }
-}
-
-internal fun unflagText(text: String): String {
-    var result = text
-    for ((pattern, replacement) in FLAGGED_TEXT) result = pattern.replace(result, replacement)
-    return result
-}
-
-internal fun normalizeCodeBuddyToolChoice(obj: JsonObject) {
-    val choice = obj.get("tool_choice") ?: return
-    when {
-        choice.isJsonPrimitive -> {
-            if (choice.asString.equals("none", ignoreCase = true)) {
-                obj.remove("tool_choice")
-                obj.remove("tools")
-                obj.remove("functions")
-            }
-        }
-        choice.isJsonObject -> {
-            val type = choice.asJsonObject.get("type")?.asString.orEmpty().lowercase()
-            when (type) {
-                "none" -> {
-                    obj.remove("tool_choice")
-                    obj.remove("tools")
-                    obj.remove("functions")
-                }
-                "auto", "required" -> obj.addProperty("tool_choice", type)
-                "function" -> {
-                    val name = choice.asJsonObject.objOrNull("function")?.get("name")?.asString.orEmpty()
-                    obj.addProperty("tool_choice", name.ifEmpty { "auto" })
-                }
-                else -> obj.remove("tool_choice")
-            }
-        }
-        else -> obj.remove("tool_choice")
-    }
-}
-
-/** 解析响应体；不是合法 JSON 时返回 null。 */
-private fun jsonOf(body: String): JsonObject? =
-    runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull()
-
-/** 按顺序取第一个能解析成数字的字段（用于 credits / reward_credit 这类可能是字符串的字段）。 */
-internal fun JsonObject.firstNumber(vararg keys: String): Double? {
-    for (key in keys) {
-        val value = get(key) ?: continue
-        if (value.isJsonNull) continue
-        if (value.isJsonPrimitive) {
-            val prim = value.asJsonPrimitive
-            if (prim.isNumber) return prim.asDouble
-            prim.asString.trim().toDoubleOrNull()?.let { return it }
-        }
-    }
-    return null
-}
-
-/** 生成一个小写 UUIDv4（幂等键用，每次请求都要全新）。 */
-internal fun uuid4(): String = java.util.UUID.randomUUID().toString()
-
-/**
- * 把上游响应体整理成一句可读的补充说明。
- *
- * 上游报错时只给 HTTP 状态码是不够的（400 可能是参数、头、或账号状态问题），
- * 必须把 `msg` 或响应原文带出来，用户才能反馈、我们才能定位。
- */
-private fun describeBody(body: String): String {
-    if (body.isBlank()) return ""
-    val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull()
-    val message = obj?.firstString("msg", "message", "desc", "error") ?: ""
-    if (message.isNotEmpty()) return "：$message"
-    return "：${body.trim().take(160)}"
 }
