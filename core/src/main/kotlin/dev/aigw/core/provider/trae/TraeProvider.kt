@@ -1,0 +1,489 @@
+package dev.aigw.core.provider.trae
+
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import dev.aigw.core.provider.AggregatedChatCall
+import dev.aigw.core.provider.AuthKind
+import dev.aigw.core.provider.ChatCall
+import dev.aigw.core.provider.CreditInfo
+import dev.aigw.core.provider.ErrorKind
+import dev.aigw.core.provider.FailedChatCall
+import dev.aigw.core.provider.LineTransformStream
+import dev.aigw.core.provider.Provider
+import dev.aigw.core.provider.ProviderAccount
+import dev.aigw.core.provider.ProviderActionResult
+import dev.aigw.core.provider.ProviderCapability
+import dev.aigw.core.provider.ProviderHooks
+import dev.aigw.core.provider.ProviderModel
+import dev.aigw.core.provider.ProviderModelCatalogView
+import dev.aigw.core.provider.QuotaPack
+import dev.aigw.core.provider.StreamFailureChatCall
+import dev.aigw.core.provider.StreamingChatCall
+import dev.aigw.core.provider.UpstreamError
+import dev.aigw.core.provider.WebLoginSupport
+import dev.aigw.core.provider.WebLoginTicket
+import dev.aigw.core.provider.isStreamingBody
+import dev.aigw.core.provider.queryParam
+import dev.aigw.core.provider.requestedModelOf
+import dev.aigw.core.store.KeyValueStore
+import dev.aigw.core.util.newCompletionId
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Trae 国内版 SOLO 通道。
+ *
+ * 上游是私有协议（`llm_utils_chat` + 自定义 SSE 事件），所以这里承担最重的转换：
+ * 请求体由 [TraePayload] 改写，响应流由 [SoloSseParser] + [OpenAiSseTranslator] 翻译成 OpenAI SSE，
+ * 非流式则由 [OpenAiAggregator] 聚合。对网关来说它和别的 provider 没有区别。
+ */
+class TraeProvider(
+    private val store: KeyValueStore,
+    private val version: () -> TraeVersion,
+    private val defaultModel: () -> String,
+    private val hooks: ProviderHooks = ProviderHooks(),
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+) : Provider, WebLoginSupport, dev.aigw.core.provider.RegionAwareSupport {
+
+    override val id: String = ID
+    override val displayName: String = "Trae"
+    override val authKind: AuthKind = AuthKind.WEBVIEW_CALLBACK
+    override val capabilities: Set<ProviderCapability> =
+        setOf(ProviderCapability.CREDIT_REFRESH, ProviderCapability.CHECKIN)
+
+    // 国内 / 国际两套客户端：上游 host 不同（trae.cn vs trae.ai），按账号区域取用。
+    // 网关多线程并发调用 openChat/listModels，reconfigure() 也会并发 clear()，
+    // 故必须用 ConcurrentHashMap（普通 HashMap 并发读写会死循环/丢数据）。
+    private val chatClients = ConcurrentHashMap<TraeRegion, TraeChatClient>()
+    private val authClients = ConcurrentHashMap<TraeRegion, TraeAuthClient>()
+    private val checkinClients = ConcurrentHashMap<TraeRegion, TraeCheckinClient>()
+    private val catalogs = ConcurrentHashMap<TraeRegion, TraeModelCatalog>()
+
+    private fun chatClient(region: TraeRegion): TraeChatClient =
+        chatClients.computeIfAbsent(region) { TraeChatClient(version(), region.agentHost) }
+
+    // TraeAuthClient 读取账号自身的 apiHost，不按区域分实例
+    private val authClientSingleton: TraeAuthClient get() = authClients.computeIfAbsent(TraeRegion.CN) { TraeAuthClient(version()) }
+
+    @Suppress("UNUSED_PARAMETER")
+    private fun authClient(region: TraeRegion): TraeAuthClient = authClientSingleton
+
+    private fun checkinClient(region: TraeRegion): TraeCheckinClient =
+        checkinClients.computeIfAbsent(region) { TraeCheckinClient(version(), region.ugHost) }
+
+    private fun catalog(region: TraeRegion): TraeModelCatalog =
+        catalogs.computeIfAbsent(region) { TraeModelCatalog(chatClient(region), nowMillis) }
+
+    /** 客户端版本号变更后重建各客户端，并让模型目录缓存失效。 */
+    fun reconfigure() {
+        chatClients.clear()
+        authClients.clear()
+        checkinClients.clear()
+        catalogs.clear()
+    }
+
+    // ------------------------------------------------------------------ 区域
+
+    /** Trae 两种发行版：国内 trae.cn / 国际 trae.ai。 */
+    override fun regions(): List<String> = TraeRegion.entries.map { it.id }
+
+    override fun regionOf(account: ProviderAccount): String? {
+        val trae = parseOrNull(account) ?: return TraeRegion.CN.id
+        return TraeRegion.infer(trae.domain, trae.apiHost).id
+    }
+
+    private fun regionOfAccount(account: ProviderAccount?): TraeRegion {
+        val trae = account?.let { parseOrNull(it) } ?: return TraeRegion.CN
+        return TraeRegion.infer(trae.domain, trae.apiHost)
+    }
+
+    /** 已经解析成 [TraeAccount] 时直接用它的域名判区域，避免再解析一遍。 */
+    private fun regionOfAccount(account: TraeAccount?): TraeRegion =
+        TraeRegion.infer(account?.domain, account?.apiHost)
+
+    // ------------------------------------------------------------------ 模型
+
+    override fun listModels(account: ProviderAccount?): ProviderModelCatalogView {
+        val trae = account?.let { parseOrNull(it) }
+        val region = regionOfAccount(account)
+        val catalog = catalog(region)
+        val models = catalog.models(trae)
+        return ProviderModelCatalogView(
+            models = models.map { model ->
+                // 倍率不是上游字段（get_detail_param 不返回），取自本地维护的 ModelRates 参考表；
+                // 查不到就不写 extra，UI 显示「—」而不是编造数字。
+                val rate = ModelRates.rateOf(model.id)
+                ProviderModel(
+                    id = model.id,
+                    name = model.name,
+                    contextWindow = model.contextWindow,
+                    extra = buildMap {
+                        if (rate != null) {
+                            put("rate", rate.baseLabel())
+                            put("rateSummary", rate.summaryLabel())
+                            rate.discountLabel()?.let { put("rateDiscount", it) }
+                            rate.discountTag?.let { put("rateDiscountTag", it) }
+                            put("rateNote", rate.note)
+                        }
+                    },
+                )
+            },
+            fromFallback = catalog.fromFallback,
+            error = catalog.lastError,
+        )
+    }
+
+    override fun invalidateModelCache() {
+        for (catalog in catalogs.values) catalog.invalidate()
+    }
+
+    override fun resolveModel(requested: String): String {
+        val model = requested.trim()
+        if (model.isEmpty() || model == "auto") return defaultModel()
+        // 去掉 `xxx__dev` 这类内部后缀；查不到目录就原样交给上游判定
+        return model.substringBefore("__")
+    }
+
+    override fun isInternalModel(id: String): Boolean = TraeModelCatalog.isInternal(id)
+
+    /**
+     * 上游域名后缀（代理分流的判定依据），从区域定义推导，避免手写清单与区域脱节。
+     *
+     * 只列网关自己会出站访问的 host（agent / 额度 / 鉴权）：登录页由系统浏览器打开，不走这里。
+     */
+    override fun hosts(): List<String> =
+        TraeRegion.entries
+            .flatMap { listOf(it.agentHost, it.ugHost, it.oauthHost) }
+            .map { it.removePrefix("https://") }
+            .distinct()
+
+    // ------------------------------------------------------------------ 对话
+
+    override fun openChat(account: ProviderAccount, openAiBody: String): ChatCall {
+        val trae = parseOrNull(account) ?: return FailedChatCall(401, "账号凭证无法解析")
+        val model = resolveModel(requestedModelOf(openAiBody))
+        val call = try {
+            chatClient(regionOfAccount(account)).openStream(trae, openAiBody)
+        } catch (e: TraeHttpException) {
+            return FailedChatCall(e.status, e.body)
+        }
+        if (call.status >= 400) return FailedChatCall(call.status, call.errorBody)
+        // 上游 200 但没回 SSE（签名失效时常直接回 JSON 错误体）：errorBody 已带诊断信息
+        val stream = call.stream ?: return FailedChatCall(call.status, call.errorBody)
+
+        if (isStreamingBody(openAiBody)) {
+            val parser = SoloSseParser()
+            val translator = OpenAiSseTranslator(newCompletionId(), model)
+            val transformed = LineTransformStream(
+                source = stream,
+                transform = transform@{ line ->
+                    val event = parser.feed(line) ?: return@transform emptyList()
+                    report(event, trae.uid)
+                    translator.translate(event)
+                },
+                onFinish = { translator.close() },
+            )
+            return StreamingChatCall(call.status, transformed) { call.close() }
+        }
+
+        val parser = SoloSseParser()
+        val aggregator = OpenAiAggregator(newCompletionId(), model)
+        try {
+            stream.bufferedReader(Charsets.UTF_8).use { reader ->
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    val event = parser.feed(line) ?: continue
+                    aggregator.accept(event)
+                }
+            }
+        } catch (e: Exception) {
+            return FailedChatCall(200, e.message ?: "读取上游流失败")
+        } finally {
+            call.close()
+        }
+        aggregator.soloCredits?.let { hooks.onBilling(id, trae.uid, it) }
+        val failure = aggregator.failure
+        if (failure != null) {
+            return StreamFailureChatCall(
+                200,
+                UpstreamError(failure.kind.toErrorKind(), failure.message.ifEmpty { "上游流内错误" }, failure.code),
+            )
+        }
+        return AggregatedChatCall(200, aggregator.build().toString())
+    }
+
+    override fun refreshAccount(account: ProviderAccount, skewSeconds: Long): ProviderAccount? {
+        val trae = parseOrNull(account) ?: return null
+        val refreshed = authClient(regionOfAccount(account)).refreshIfNeeded(trae, skewSeconds) ?: return null
+        return toProviderAccount(refreshed)
+    }
+
+    /** 粘贴 JSON 凭证导入：补齐设备指纹后换 token 并拉取用户信息。 */
+    override fun importCredentials(raw: String): ProviderAccount {
+        var account = ensureDeviceIds(TraeAccount.parse(raw))
+        val region = TraeRegion.infer(account.domain, account.apiHost)
+        if (account.refreshToken.isNotEmpty()) account = authClient(region).exchangeToken(account)
+        account = authClient(region).getUserInfo(account)
+        if (account.uid.isEmpty()) throw IllegalStateException("无法确定账号 uid，请确认凭证完整")
+        return toProviderAccount(account)
+    }
+
+    // ------------------------------------------------------------------ 设备指纹
+
+    /** 当前账号用于 `x-device-id` 的设备指纹。 */
+    fun deviceIdOf(account: ProviderAccount): String = parseOrNull(account)?.deviceId.orEmpty()
+
+    /**
+     * 校验设备 ID 格式；返回空串表示合法。
+     *
+     * 官方客户端的 `x-device-id` 是纯数字（15~16 位），非数字值会被上游以 9074 拒绝签到。
+     */
+    fun validateDeviceId(value: String): String {
+        val trimmed = value.trim()
+        if (trimmed.isEmpty()) return "设备 ID 不能为空"
+        if (!TraeLogin.looksLikeDeviceId(trimmed)) {
+            return "设备 ID 应该是纯数字（15~16 位）。你填的看起来不是 device_id，" +
+                "注意别把它和 64 位的 machine_id 搞混。"
+        }
+        return ""
+    }
+
+    /** 用新的设备 ID 生成新 secret（保留机器码）。 */
+    fun withDeviceId(account: ProviderAccount, deviceId: String): String {
+        val trae = parseOrNull(account) ?: return account.secret
+        return trae.copy(deviceId = deviceId.trim()).toJson().toString()
+    }
+
+    /** 重新生成一套官方格式的指纹（machine_id 64 位 hex + device_id 纯数字），返回新 secret。 */
+    fun regenerateDeviceIds(account: ProviderAccount): String {
+        val trae = parseOrNull(account) ?: return account.secret
+        return trae.copy(
+            machineId = TraeLogin.newMachineId(),
+            deviceId = TraeLogin.randomDeviceId(),
+        ).toJson().toString()
+    }
+
+    override fun classify(status: Int, body: String): UpstreamError {
+        val kind = TraeErrors.fromStatus(status, body)
+        val exception = TraeHttpException(status, kind, body, TraeErrors.extractCode(body))
+        return UpstreamError(kind.toErrorKind(), exception.message ?: "上游错误", exception.upstreamCode)
+    }
+
+    // ------------------------------------------------------------------ 额度 / 动作
+
+    override fun creditInfo(account: ProviderAccount): CreditInfo? {
+        val trae = parseOrNull(account) ?: return null
+        return try {
+            val usage = checkinClient(regionOfAccount(account)).entUsage(trae)
+            if (usage.parsed) {
+                CreditInfo(usage.remain, known = true, detail = "权益包剩余 ${usage.remain} / ${usage.limit}")
+            } else {
+                CreditInfo(0, known = false, detail = "上游未返回可解析的额度")
+            }
+        } catch (e: TraeHttpException) {
+            CreditInfo(0, known = false, detail = e.message ?: "刷新额度失败")
+        } catch (e: Exception) {
+            CreditInfo(0, known = false, detail = e.message ?: "刷新额度失败")
+        }
+    }
+
+    override fun performAction(
+        account: ProviderAccount,
+        action: String,
+        payload: JsonObject,
+    ): ProviderActionResult = when (action) {
+        ACTION_CHECKIN -> {
+            // 国际版没有签到制度（前端 JS 里 checkin 零命中）
+            if (regionOfAccount(account) == TraeRegion.INTL) {
+                ProviderActionResult.failure("国际版没有签到制度")
+            } else {
+                checkin(account)
+            }
+        }
+        else -> ProviderActionResult.unsupported(action)
+    }
+
+    /** Trae 的额度包明细（账单口径，不随 SOLO 消耗变化）。 */
+    override fun creditPacks(account: ProviderAccount): List<QuotaPack> {
+        val trae = parseOrNull(account) ?: return emptyList()
+        return try {
+            checkinClient(regionOfAccount(account)).entUsage(trae).details.map {
+                QuotaPack(
+                    name = it.name,
+                    group = it.group,
+                    limit = it.limit,
+                    used = it.used,
+                    remain = it.remain,
+                    expireAt = it.expireAt,
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * 单个账号签到：先查状态 → 未签到则领取 → 9074（设备指纹/限流被拒）退避后重试一次。
+     * 额度刷新由网关在动作成功后另行调用 [creditInfo] 完成。
+     */
+    private fun checkin(account: ProviderAccount): ProviderActionResult {
+        val trae = parseOrNull(account) ?: return ProviderActionResult.failure("账号凭证无法解析")
+        return try {
+            val status = checkinClient(regionOfAccount(account)).status(trae)
+            if (status.checkedIn) return ProviderActionResult.success("今日已签到")
+            val outcome = claimWithRetry(trae)
+            if (outcome == ClaimOutcome.ALREADY_CHECKED_IN) {
+                ProviderActionResult.success("今日已签到")
+            } else {
+                ProviderActionResult.success("签到成功")
+            }
+        } catch (e: TraeHttpException) {
+            ProviderActionResult.failure(traeErrorMessage(e))
+        } catch (e: Exception) {
+            ProviderActionResult.failure(e.message ?: "签到失败")
+        }
+    }
+
+    private fun claimWithRetry(account: TraeAccount): ClaimOutcome = try {
+        checkinClient(regionOfAccount(account)).claim(account)
+    } catch (e: TraeHttpException) {
+        if (e.upstreamCode != CHECKIN_BUSY_CODE) throw e
+        Thread.sleep(CHECKIN_RETRY_DELAY_MS)
+        checkinClient(regionOfAccount(account)).claim(account)
+    }
+
+    // ------------------------------------------------------------------ 登录
+
+    /** 进行中的登录 traceId → 设备指纹；同一进程内回调直接命中，限容防止长期累积。 */
+    private val pending = object : LinkedHashMap<String, Pair<String, String>>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, String>>): Boolean =
+            size > MAX_PENDING
+    }
+
+    /** pending 指纹的持久化键；进程被杀后由 [resolveMachine] 从 store 找回。 */
+    private fun pendingKey(traceId: String): String = "login/pending/trae/$traceId"
+
+    override fun beginWebLogin(callbackUrl: String, region: String): WebLoginTicket {
+        val target = TraeRegion.of(region)
+        // 对齐官方客户端指纹格式：machine_id 是 64 位 hex，device_id 是纯数字
+        val machineId = TraeLogin.newMachineId()
+        val deviceId = TraeLogin.randomDeviceId()
+        val traceId = TraeLogin.machineTraceId(machineId, deviceId)
+        synchronized(pending) {
+            pending[traceId] = machineId to deviceId
+        }
+        // 同时落盘：进程被杀或回调晚到时，仍能拿回与登录一致的设备指纹
+        store.write(
+            pendingKey(traceId),
+            JsonObject().apply {
+                addProperty("machineId", machineId)
+                addProperty("deviceId", deviceId)
+                addProperty("at", nowMillis())
+            }.toString(),
+        )
+        return WebLoginTicket(
+            traceId,
+            TraeLogin.buildLoginUrl(machineId, deviceId, callbackUrl, region = target),
+            callbackUrl,
+        )
+    }
+
+    override fun completeWebLogin(callbackUrl: String): ProviderAccount {
+        val callback = TraeLogin.parseCallback(callbackUrl)
+        val traceId = queryParam(callbackUrl, "loginTraceID")
+        val machine = resolveMachine(traceId)
+        // 回调里的 loginHost / 回调域名能区分发行版；拿不到就按国内版处理
+        val region = TraeRegion.infer(
+            queryParam(callbackUrl, "loginHost"),
+            callback.enterpriseId.ifEmpty { queryParam(callbackUrl, "host") },
+        )
+        var account = TraeAccount(
+            uid = callback.uid,
+            accessToken = callback.accessToken,
+            refreshToken = callback.refreshToken,
+            expiresAt = callback.expiresAt,
+            nickname = callback.nickname,
+            enterpriseId = callback.enterpriseId,
+            machineId = machine?.first ?: TraeLogin.newMachineId(),
+            deviceId = machine?.second ?: TraeLogin.randomDeviceId(),
+            domain = region.id,
+            apiHost = region.oauthHost,
+        )
+        if (account.refreshToken.isNotEmpty()) account = authClient(region).exchangeToken(account)
+        account = authClient(region).getUserInfo(account)
+        if (account.uid.isEmpty()) throw IllegalStateException("无法确定账号 uid，请确认登录已完成")
+        return toProviderAccount(account)
+    }
+
+    /**
+     * 找回登录时用过的设备指纹。
+     * 找不回来意味着凭证的设备指纹与注册设备不一致（UG 接口会以 9074 拒绝签到），
+     * 所以只做查找，不静默换新的。
+     */
+    private fun resolveMachine(traceId: String?): Pair<String, String>? {
+        if (traceId.isNullOrEmpty()) return null
+        synchronized(pending) { pending[traceId] }?.let { return it }
+        val raw = store.read(pendingKey(traceId)) ?: return null
+        val obj = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull() ?: return null
+        val machineId = obj.get("machineId")?.asString.orEmpty()
+        val deviceId = obj.get("deviceId")?.asString.orEmpty()
+        return if (machineId.isEmpty() || deviceId.isEmpty()) null else machineId to deviceId
+    }
+
+    // ------------------------------------------------------------------ 工具
+
+    private fun report(event: SoloEvent, uid: String) {
+        when (event) {
+            is SoloEvent.NotifyUsage -> event.ideCredits?.let { hooks.onBilling(id, uid, it) }
+            is SoloEvent.Failure -> {
+                val kind = SoloStreamError(event.code, event.message).kind
+                hooks.onAccountError(
+                    id,
+                    uid,
+                    UpstreamError(kind.toErrorKind(), event.message.ifEmpty { "上游流内错误" }, event.code),
+                )
+            }
+            else -> Unit
+        }
+    }
+
+    private fun toProviderAccount(account: TraeAccount): ProviderAccount =
+        ProviderAccount(id, account.uid, account.nickname, account.toJson().toString())
+
+    private fun parseOrNull(account: ProviderAccount): TraeAccount? =
+        runCatching { TraeAccount.parse(account.secret) }.getOrNull()
+
+    companion object {
+        const val ID = "trae"
+
+        /** 「签到」这个 provider 专属动作的名字，UI 组件与 provider 约定一致。 */
+        const val ACTION_CHECKIN = dev.aigw.core.provider.ACTION_CHECKIN
+
+        private const val MAX_PENDING = 40
+        private const val CHECKIN_BUSY_CODE = 9074L
+        private const val CHECKIN_RETRY_DELAY_MS = 8_000L
+    }
+}
+
+/** 把不符合官方格式的设备指纹就地修正（machine_id 64 位 hex、device_id 纯数字）。 */
+internal fun ensureDeviceIds(account: TraeAccount): TraeAccount {
+    var result = account
+    if (result.machineId.length != 64) result = result.copy(machineId = TraeLogin.newMachineId())
+    if (!TraeLogin.looksLikeDeviceId(result.deviceId)) result = result.copy(deviceId = TraeLogin.randomDeviceId())
+    return result
+}
+
+/** 把上游异常转成一句人话；少数码需要补充「怎么做」。 */
+internal fun traeErrorMessage(e: TraeHttpException): String = when (e.upstreamCode) {
+    9074L -> "签到被拒：设备指纹未通过校验，去账号详情点「重新生成」后重试"
+    4001L -> "模型或客户端版本不被上游接受（可在供应商设置里上调版本号）"
+    else -> e.message ?: "上游错误"
+}
+
+internal fun TraeErrorKind.toErrorKind(): ErrorKind = when (this) {
+    TraeErrorKind.PLAN_LIMIT -> ErrorKind.QUOTA
+    TraeErrorKind.SOFT_RATE -> ErrorKind.SOFT_RATE
+    TraeErrorKind.NOT_FOUND -> ErrorKind.NOT_FOUND
+    TraeErrorKind.SESSION_DEAD -> ErrorKind.SESSION_DEAD
+    TraeErrorKind.SERVER -> ErrorKind.SERVER
+    TraeErrorKind.CLIENT -> ErrorKind.CLIENT
+}

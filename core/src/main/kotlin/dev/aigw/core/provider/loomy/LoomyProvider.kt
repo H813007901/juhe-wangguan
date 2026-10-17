@@ -1,0 +1,399 @@
+package dev.aigw.core.provider.loomy
+
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import dev.aigw.core.provider.ACTION_TASKS
+import dev.aigw.core.provider.AggregatedChatCall
+import dev.aigw.core.provider.PasswordLoginSupport
+import dev.aigw.core.provider.SessionProbeSupport
+import dev.aigw.core.provider.AuthKind
+import dev.aigw.core.provider.ChatCall
+import dev.aigw.core.provider.CreditInfo
+import dev.aigw.core.provider.ErrorKind
+import dev.aigw.core.provider.FailedChatCall
+import dev.aigw.core.provider.isStreamingBody
+import dev.aigw.core.provider.OpenAiSseAggregator
+import dev.aigw.core.provider.Provider
+import dev.aigw.core.provider.ProviderAccount
+import dev.aigw.core.provider.ProviderActionResult
+import dev.aigw.core.provider.ProviderCapability
+import dev.aigw.core.provider.ProviderModel
+import dev.aigw.core.provider.ProviderModelCatalogView
+import dev.aigw.core.provider.QuotaPack
+import dev.aigw.core.provider.requestedModelOf
+import dev.aigw.core.provider.SmsLoginSupport
+import dev.aigw.core.provider.StreamFailureChatCall
+import dev.aigw.core.provider.StreamingChatCall
+import dev.aigw.core.provider.UpstreamError
+
+/**
+ * Loomy（讯飞）免费积分通道。
+ *
+ * 上游 `/api/v1/chat/completions` 本身就是 OpenAI 兼容协议，所以这里几乎不做协议改写：
+ * 选号 → 补认证/追踪头 → 转发 → 原样回传 SSE。需要注意上游对鉴权失败返回的是
+ * **HTTP 200 + 业务码**（不是 4xx），必须按业务码判定，否则会把错误 JSON 当正常响应透传。
+ */
+class LoomyProvider(
+    private val defaultModel: () -> String,
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val pointsClient: LoomyPointsClient = LoomyPointsClient(),
+    private val authClient: LoomyAuthClient = LoomyAuthClient(nowMillis = nowMillis),
+) : Provider, SmsLoginSupport, PasswordLoginSupport, SessionProbeSupport {
+
+    override val id: String = ID
+    override val displayName: String = "Loomy"
+    override val authKind: AuthKind = AuthKind.SMS_CODE
+    override val capabilities: Set<ProviderCapability> =
+        setOf(ProviderCapability.CREDIT_REFRESH, ProviderCapability.TASKS)
+
+    private val chatClient = LoomyChatClient()
+    private val taskClient = LoomyTaskClient()
+    private val catalog = LoomyModelCatalog(nowMillis = nowMillis)
+
+    // ------------------------------------------------------------------ 模型
+
+    override fun listModels(account: ProviderAccount?): ProviderModelCatalogView {
+        val session = account?.let { parseOrNull(it)?.session }
+        val models = catalog.models(session)
+        return ProviderModelCatalogView(
+            models = models.map {
+                ProviderModel(
+                    id = it.id,
+                    name = it.name,
+                    contextWindow = it.contextLength,
+                    extra = buildMap {
+                        if (it.reasoning) put("reasoning", "1")
+                        if (it.toolCall) put("tool_call", "1")
+                        if (it.attachment) put("attachment", "1")
+                        // 倍率上游字段名未核实（探测 ratio/price/multiplier/modelRate），未知就不写，界面显示「—」
+                        if (it.ratio >= 0) put("rate", "${it.ratio}×")
+                    },
+                )
+            },
+            fromFallback = catalog.fromFallback,
+            error = catalog.lastError,
+        )
+    }
+
+    override fun invalidateModelCache() {
+        catalog.invalidate()
+    }
+
+    override fun resolveModel(requested: String): String {
+        val model = requested.trim()
+        if (model.isEmpty() || model == "auto") return defaultModel()
+        // 去掉 `provider/model` 里的 provider 前缀
+        return model.substringAfter('/').trim().ifEmpty { model }
+    }
+
+    override fun hosts(): List<String> = listOf("xfinfr.com", "xunfei.cn")
+
+    // ------------------------------------------------------------------ 对话
+
+    override fun openChat(account: ProviderAccount, openAiBody: String): ChatCall {
+        val loomy = parseOrNull(account) ?: return FailedChatCall(401, "账号凭证无法解析")
+        val model = resolveModel(requestedModelOf(openAiBody))
+        val streaming = isStreamingBody(openAiBody)
+
+        val call = try {
+            chatClient.openStream(loomy, openAiBody)
+        } catch (e: LoomyApiException) {
+            return FailedChatCall(e.status, e.body)
+        }
+        if (call.status !in 200..299) return FailedChatCall(call.status, call.errorBody)
+
+        // 上游回 JSON：可能是正常非流式响应，也可能是「HTTP 200 + 业务错误码」
+        if (!call.isEventStream) {
+            val text = runCatching { call.stream?.use { it.readBytes().toString(Charsets.UTF_8) } }
+                .getOrNull() ?: call.errorBody
+            call.close()
+            val code = LoomyErrors.extractCode(text)
+            if (code.isNotEmpty() && code != LoomyConstants.CODE_OK) {
+                val kind = LoomyErrors.fromStatus(200, text)
+                return StreamFailureChatCall(
+                    200,
+                    UpstreamError(kind.toErrorKind(), LoomyErrors.extractMessage(text), 0),
+                )
+            }
+            return AggregatedChatCall(200, text)
+        }
+
+        if (streaming) {
+            return StreamingChatCall(200, call.stream!!) { call.close() }
+        }
+        val aggregated = try {
+            OpenAiSseAggregator.aggregate(call.stream!!, model)
+        } finally {
+            call.close()
+        }
+        return AggregatedChatCall(200, aggregated)
+    }
+
+    override fun classify(status: Int, body: String): UpstreamError {
+        val kind = LoomyErrors.fromStatus(status, body)
+        val exception = LoomyApiException(status, kind, body, LoomyErrors.extractCode(body))
+        return UpstreamError(kind.toErrorKind(), exception.message ?: "上游错误")
+    }
+
+    // ------------------------------------------------------------------ 额度 / 动作
+
+    override fun creditInfo(account: ProviderAccount): CreditInfo? {
+        val loomy = parseOrNull(account)
+            ?: throw IllegalStateException("账号凭证无法解析，请重新登录")
+        return try {
+            val snapshot = pointsClient.balance(loomy.session)
+            // 对话扣的是当日赠送账本（实测会随消耗下降），而 balance 字段是永久账本不动；
+            // 可用总余额 = 主账本 + 当日剩余，两者都来自 records。
+            // 当日剩余的取值必须与 creditPacks 的「当日赠送」行完全一致：
+            // 上游实测只回 dailyBalance 不回 dailyRemainingPoints，这里漏兑底就会出现
+            // 「额度包有 2992、余额还是一万」的不同步（0.1.83 就是这个 bug）。
+            // （Web 版的 /api/auth/points-summary 在桌面端 base 下实测 404，不要再用。）
+            val daily = when {
+                snapshot.dailyRemaining >= 0 -> snapshot.dailyRemaining
+                snapshot.dailyBalance >= 0 -> snapshot.dailyBalance
+                else -> 0L
+            }
+            CreditInfo(
+                balance = snapshot.balance + daily,
+                known = snapshot.known,
+                detail = when {
+                    snapshot.known -> "${snapshot.source}=${snapshot.balance}，当日剩余=${formatOrDash(if (daily > 0) daily else -1L)}"
+                    // 两个账本都没拿到数：带响应片段，便于区分 session 失效与接口口径变化
+                    else -> "未取到余额（响应片段：${snapshot.personalRaw.take(120)}）"
+                },
+            )
+        } catch (e: LoomyApiException) {
+            CreditInfo(0, known = false, detail = e.message ?: "刷新积分失败")
+        } catch (e: Exception) {
+            CreditInfo(0, known = false, detail = e.message ?: "刷新积分失败")
+        }
+    }
+
+    /** Loomy 没有「额度包」，但有两个账本（个人/团队）与当日赠送额度，都列出来。 */
+    override fun creditPacks(account: ProviderAccount): List<QuotaPack> {
+        val loomy = parseOrNull(account)
+            ?: throw IllegalStateException("账号凭证无法解析，请重新登录")
+        return try {
+            val snapshot = pointsClient.balance(loomy.session)
+            buildList {
+                if (snapshot.personal >= 0) {
+                    add(QuotaPack(name = "个人积分", group = "个人", remain = snapshot.personal))
+                }
+                if (snapshot.team >= 0) {
+                    add(QuotaPack(name = "团队积分", group = "团队", remain = snapshot.team))
+                }
+                // 官方 Web 版读的是 dailyBalance；桌面 records 可能只回 dailyRemainingPoints，两者任一存在都列出
+                val dailyRemain = when {
+                    snapshot.dailyRemaining >= 0 -> snapshot.dailyRemaining
+                    snapshot.dailyBalance >= 0 -> snapshot.dailyBalance
+                    else -> -1L
+                }
+                if (dailyRemain >= 0) {
+                    add(
+                        QuotaPack(
+                            name = "当日赠送",
+                            group = "每日",
+                            limit = snapshot.dailyLimit.coerceAtLeast(0),
+                            used = snapshot.dailyConsumed.coerceAtLeast(0),
+                            remain = dailyRemain,
+                        ),
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override fun performAction(
+        account: ProviderAccount,
+        action: String,
+        payload: JsonObject,
+    ): ProviderActionResult {
+        val loomy = parseOrNull(account) ?: return ProviderActionResult.failure("账号凭证无法解析")
+        return try {
+            when (action) {
+                ACTION_REDEEM_INVITE -> {
+                    val code = payload.get("inviteCode")?.asString.orEmpty().trim()
+                    if (code.isEmpty()) return ProviderActionResult.failure("邀请码不能为空")
+                    pointsClient.activate(loomy.session, code)
+                    ProviderActionResult.success("邀请码兑换成功")
+                }
+
+                ACTION_REDEEM_CODE -> {
+                    val code = payload.get("code")?.asString.orEmpty().trim()
+                    if (code.isEmpty()) return ProviderActionResult.failure("兑换码不能为空")
+                    pointsClient.redeemCode(loomy.session, code)
+                    ProviderActionResult.success("兑换码兑换成功")
+                }
+
+                ACTION_COMPLETE_TASK -> {
+                    val key = payload.get("key")?.asString.orEmpty()
+                    val result = taskClient.complete(loomy.session, key)
+                    val title = LoomyTaskClient.titleOf(key)
+                    if (result.alreadyCompleted) {
+                        ProviderActionResult.success("$title：此前已完成")
+                    } else {
+                        ProviderActionResult.success("$title：已完成")
+                    }
+                }
+
+                // UI 与管理端点统一发 ACTION_TASKS；Loomy 上游语义是「一键完成全部成长任务」
+                ACTION_TASKS, ACTION_COMPLETE_ALL_TASKS -> {
+                    val pending = taskClient.tasks(loomy.session).tasks.filter { !it.completed }
+                    if (pending.isEmpty()) return ProviderActionResult.success("所有任务都已完成")
+                    val lines = pending.map { task ->
+                        val result = taskClient.complete(loomy.session, task.key)
+                        "${task.title}：${if (result.alreadyCompleted) "此前已完成" else "已完成"}"
+                    }
+                    ProviderActionResult.success(lines.joinToString("；"))
+                }
+
+                ACTION_LIST_INVITES -> {
+                    val invites = pointsClient.listInvites(loomy.session)
+                    if (invites.isEmpty()) {
+                        ProviderActionResult.success("暂无邀请码")
+                    } else {
+                        ProviderActionResult.success(invites.joinToString("\n") { it.listLine() })
+                    }
+                }
+
+                // 上游 GET /invitation-codes 即幂等的「生成 + 列表」，没有独立生成端点
+                ACTION_GENERATE_INVITE -> {
+                    val invites = pointsClient.listInvites(loomy.session)
+                    if (invites.isEmpty()) {
+                        ProviderActionResult.success("邀请码已就绪（0 个）")
+                    } else {
+                        ProviderActionResult.success(
+                            "邀请码已就绪（${invites.size} 个）：\n" + invites.joinToString("\n") { it.listLine() },
+                        )
+                    }
+                }
+
+                else -> ProviderActionResult.unsupported(action)
+            }
+        } catch (e: LoomyApiException) {
+            ProviderActionResult.failure(e.message ?: "操作失败")
+        } catch (e: Exception) {
+            ProviderActionResult.failure(e.message ?: "操作失败")
+        }
+    }
+
+    // ------------------------------------------------------------------ 登录
+
+    override fun sendSmsCode(phone: String, ccode: String): String {
+        val normalized = phone.trim()
+        validatePhone(normalized, ccode)
+        return authClient.sendSmsCode(normalized, ccode)
+    }
+
+    override fun loginBySmsCode(
+        phone: String,
+        code: String,
+        msgid: String,
+        ccode: String,
+    ): ProviderAccount {
+        val account = authClient.loginBySmsCode(phone.trim(), code.trim(), msgid, ccode)
+        var nickname = ""
+        runCatching { nickname = authClient.nicknameOf(authClient.getUserInfo(account.session)) }
+        // 上游没给 userid 时退回手机号当 uid，账号至少可用且可重复登录覆盖
+        val uid = account.uid.ifEmpty { account.phone }
+        return toProviderAccount(account.copy(uid = uid, nickname = nickname))
+    }
+
+    // ------------------------------------------------------------------ 工具
+
+    /**
+     * 校验手机号。
+     *
+     * 大陆号严格要求 11 位；其它国家码只校验位数区间——
+     * 各国家号码长度不一（香港 8 位、日本 10 位…），写死大陆规则会把它们全挡掉。
+     */
+    private fun validatePhone(phone: String, ccode: String) {
+        val pattern = if (ccode == LoomyConstants.DEFAULT_CCODE) CN_PHONE else GENERIC_PHONE
+        if (!pattern.matches(phone)) {
+            throw IllegalArgumentException(
+                if (ccode == LoomyConstants.DEFAULT_CCODE) "手机号格式不正确（大陆号码为 11 位）"
+                else "手机号格式不正确（当前国家码 +$ccode，应为 4–15 位数字）",
+            )
+        }
+    }
+
+    private fun toProviderAccount(account: LoomyAccount): ProviderAccount =
+        ProviderAccount(id, account.uid, account.nickname, account.toJson().toString())
+
+    /** 账号密码登录：换 session 后直接入参返回，凭证含 loginid/password 供看门狗后续自动重登。 */
+    override fun loginByPassword(
+        loginid: String,
+        password: String,
+        identity: Map<String, String>,
+    ): ProviderAccount {
+        val loomy = authClient.loginByPassword(loginid, password)
+        return toProviderAccount(loomy)
+    }
+
+    /** 邀请码列表（主账号拉自己的码给新号绑定用）。 */
+    fun listInvitesOf(session: String): List<InviteCodeInfo> = pointsClient.listInvites(session)
+
+    /** 账号级包装：直接从 ProviderAccount 解 session 拉邀请码（失败返回 null）。 */
+    fun listInvitesFor(account: ProviderAccount): List<InviteCodeInfo>? =
+        parseOrNull(account)?.let { runCatching { pointsClient.listInvites(it.session) }.getOrNull() }
+
+    /** 新账号绑定邀请码。 */
+    fun activateInvite(session: String, inviteCode: String): Boolean = pointsClient.activate(session, inviteCode)
+
+    /** 会话探针：chat 域是否仍认此账号的 session（免费，不耗积分）。 */
+    override fun probeAlive(account: ProviderAccount): Boolean {
+        val loomy = parseOrNull(account) ?: return false
+        return runCatching { pointsClient.probeChatAlive(loomy.session) }.getOrDefault(false)
+    }
+
+    /**
+     * 添号：用一枚验证码登录并入池。
+     *
+     * 讯飞手机快捷登录本身就是「无账号自动注册」，所以新老号同一条路。
+     * 不设密码：Loomy 账号域（account.xfinfr.com）只有发码/验码/登出/改资料这几个接口，
+     * 没有任何设密码端点，登录返回的 SessionInfo 也只有 session/userid/phone 三个字段；
+     * 讯飞 SSO 那两条设密码接口要的是它自己的 ssoSessionId 和它自己发的短信码，认不了 Loomy 的。
+     */
+    fun completeAdd(phone: String, ccode: String, code: String, msgid: String): ProviderAccount {
+        val normalized = phone.trim()
+        validatePhone(normalized, ccode)
+        return loginBySmsCode(normalized, code, msgid, ccode)
+    }
+
+    private fun parseOrNull(account: ProviderAccount): LoomyAccount? =
+        runCatching { LoomyAccount.parse(account.secret) }.getOrNull()
+
+    companion object {
+        const val ID = "loomy"
+
+        /** Loomy 的 provider 专属动作，UI 组件与 provider 约定一致。 */
+        const val ACTION_REDEEM_INVITE = "redeem_invite"
+        const val ACTION_REDEEM_CODE = "redeem_code"
+        const val ACTION_COMPLETE_TASK = "complete_task"
+        const val ACTION_COMPLETE_ALL_TASKS = "complete_all_tasks"
+        const val ACTION_LIST_INVITES = "list_invites"
+        const val ACTION_GENERATE_INVITE = "generate_invite"
+
+        /** 中国大陆手机号：11 位、1 开头。 */
+        private val CN_PHONE = Regex("1[3-9]\\d{9}")
+
+        /** 其它地区比较宽松：4–15 位纯数字（国际号码标准上限是 15 位）。 */
+        private val GENERIC_PHONE = Regex("\\d{4,15}")
+    }
+
+}
+
+internal fun LoomyErrorKind.toErrorKind(): ErrorKind = when (this) {
+    LoomyErrorKind.SESSION_DEAD -> ErrorKind.SESSION_DEAD
+    LoomyErrorKind.QUOTA -> ErrorKind.QUOTA
+    LoomyErrorKind.SOFT_RATE -> ErrorKind.SOFT_RATE
+    LoomyErrorKind.NOT_FOUND -> ErrorKind.NOT_FOUND
+    LoomyErrorKind.CLIENT -> ErrorKind.CLIENT
+    LoomyErrorKind.SERVER -> ErrorKind.SERVER
+    LoomyErrorKind.NETWORK -> ErrorKind.NETWORK
+}
+
+/** 当日剩余额度未知（-1 哨兵值）时显示破折号。 */
+private fun formatOrDash(value: Long): String = if (value < 0) "—" else value.toString()

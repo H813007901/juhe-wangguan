@@ -1,0 +1,623 @@
+package dev.aigw.app.ui
+
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import dev.aigw.core.gateway.GatewaySettings
+import dev.aigw.core.usage.CallRecord
+import dev.aigw.core.usage.CallStatus
+import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private enum class LogTab(val label: String) { Calls("调用记录"), Requests("请求日志") }
+
+private enum class StatusFilter(val label: String) {
+    ALL("全部"), SUCCESS("成功"), FAILED("失败"), ABORTED("中断"),
+}
+
+private enum class LevelFilter(val label: String) {
+    ALL("全部"), INFO("信息"), WARN("警告"), ERROR("错误"),
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun LogsScreen(state: AppUiState, viewModel: AppViewModel) {
+    var tab by remember { mutableStateOf(LogTab.Calls) }
+    var filter by remember { mutableStateOf(StatusFilter.ALL) }
+    var levelFilter by remember { mutableStateOf(LevelFilter.ALL) }
+    var detail by remember { mutableStateOf<CallRecord?>(null) }
+    var showLogSettings by remember { mutableStateOf(false) }
+
+    // 停留在本页时自动刷新（只刷记录，不动低频数据）
+    LaunchedEffect(tab) {
+        while (true) {
+            delay(5_000)
+            viewModel.refreshRecords()
+        }
+    }
+
+    val calls = remember(state.calls, filter) {
+        state.calls.filter {
+            when (filter) {
+                StatusFilter.ALL -> true
+                StatusFilter.SUCCESS -> it.status == CallStatus.SUCCESS
+                StatusFilter.FAILED -> it.status == CallStatus.FAILED
+                StatusFilter.ABORTED -> it.status == CallStatus.ABORTED
+            }
+        }
+    }
+
+    val logs = remember(state.logs, levelFilter) {
+        when (levelFilter) {
+            LevelFilter.ALL -> state.logs
+            else -> state.logs.filter { it.level.equals(levelFilter.name, ignoreCase = true) }
+        }
+    }
+
+    // 本页自带骨架：筛选区固定在顶部，列表用 LazyColumn 懒加载。
+    // 记录最多数百条、每条含大段原文，一次性组合全部卡片会明显卡顿；
+    // 而 LazyColumn 不能嵌在 PageScaffold 的 verticalScroll 里（无限高度约束会崩），所以这里不走 PageScaffold。
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        PageHeader(
+            title = "记录",
+            subtitle = "调用与请求日志",
+            actions = {
+                IconButton(onClick = { viewModel.refresh() }) {
+                    Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                }
+                StatusChip(state.running)
+            },
+        )
+
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ChoiceChip(LogTab.Calls.label, tab == LogTab.Calls) { tab = LogTab.Calls }
+                    ChoiceChip(LogTab.Requests.label, tab == LogTab.Requests) { tab = LogTab.Requests }
+                }
+                // 两个标签下都保留设置入口，面板内容跟随当前标签（调用记录 / 请求日志 各自参数）
+                Row(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .clickable { showLogSettings = !showLogSettings }
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Settings,
+                        contentDescription = "日志设置",
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = if (showLogSettings) "收起设置" else "日志设置",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (showLogSettings) {
+                DiagnosticsSettings(state, viewModel)
+                if (tab == LogTab.Requests) {
+                    RequestLogSettings(state, viewModel)
+                } else {
+                    CallLogSettings(state, viewModel)
+                }
+            }
+            if (tab == LogTab.Calls) {
+                Text(
+                    text = "共 ${state.calls.size} 条记录",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StatusFilter.entries.forEach { option ->
+                        ChoiceChip(option.label, filter == option, { filter = option })
+                    }
+                }
+                Text(
+                    text = "点卡片看原文 · 长按删除 · 参数在右上「日志设置」里逐项调整",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    LevelFilter.entries.forEach { option ->
+                        ChoiceChip(option.label, levelFilter == option) { levelFilter = option }
+                    }
+                }
+                Text(
+                    text = "共 ${logs.size} 条日志 · 容量 ${state.settings.requestLogCapacity} 条",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "网关与上游交互的流水，环形覆盖只保留最近若干条；参数在右上「日志设置」里逐项调整。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        LazyColumn(
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            if (tab == LogTab.Calls) {
+                if (calls.isEmpty()) {
+                    item(key = "empty-calls") {
+                        SectionCard {
+                            EmptyHint(
+                                title = "暂无调用记录",
+                                message = "用任一 API Key 调用本地网关后，记录会出现在这里。",
+                            )
+                        }
+                    }
+                } else {
+                    items(calls, key = { it.id }) { record ->
+                        SectionCard {
+                            CallRow(record, onClick = { detail = record }, onLongClick = { viewModel.deleteCall(record.id) })
+                        }
+                    }
+                }
+            } else {
+                if (logs.isEmpty()) {
+                    item(key = "empty-logs") {
+                        SectionCard {
+                            EmptyHint("暂无请求日志", "启动服务并发起调用后，这里会记录每次转发与换号。")
+                        }
+                    }
+                } else {
+                    // key 用单调自增的 seq：时间戳+内容可能重复（同一秒内多条相同日志），
+                    // 重复 key 会让 LazyColumn 直接崩溃。
+                    itemsIndexed(logs, key = { _, line -> line.seq }) { _, line ->
+                        SectionCard {
+                            Text(
+                                text = line.render(),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = levelColor(line.level),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    detail?.let { record ->
+        ModalBottomSheet(onDismissRequest = { detail = null }) {
+            CallDetailSheet(record, viewModel)
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CallRow(record: CallRecord, onClick: () -> Unit, onLongClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = record.model.ifEmpty { "未指定模型" },
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = statusLabel(record.status),
+                style = MaterialTheme.typography.labelSmall,
+                color = statusColor(record.status),
+            )
+        }
+        Text(
+            text = buildString {
+                append(formatTime(record.startedAtMillis))
+                append(" · ")
+                append(if (record.streaming) "流式" else "非流式")
+                append(" · ${record.durationMillis}ms")
+                if (record.totalTokens > 0) append(" · ${record.totalTokens} tokens")
+                if (record.pointsConsumed > 0) append(" · 消耗 ${record.pointsConsumed} 积分")
+                if (record.accountNickname.isNotEmpty()) append(" · ${record.accountNickname}")
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (record.error.isNotEmpty()) {
+            Text(
+                text = record.error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                maxLines = 2,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CallDetailSheet(record: CallRecord, viewModel: AppViewModel) {
+    val clipboard = LocalClipboardManager.current
+
+    // 打开抽屉时后台加载各字段完整原文：没溢出文件（未超摘要长度或已被清理）时回落用记录内摘要。
+    var fullRequest by remember(record.id) { mutableStateOf<String?>(null) }
+    var fullResponse by remember(record.id) { mutableStateOf<String?>(null) }
+    var fullRaw by remember(record.id) { mutableStateOf<String?>(null) }
+    LaunchedEffect(record.id) {
+        val loaded = withContext(Dispatchers.IO) {
+            Triple(
+                viewModel.engineFullText(record.id, dev.aigw.core.usage.CallTextField.REQUEST),
+                viewModel.engineFullText(record.id, dev.aigw.core.usage.CallTextField.RESPONSE),
+                viewModel.engineFullText(record.id, dev.aigw.core.usage.CallTextField.RAW),
+            )
+        }
+        fullRequest = loaded.first
+        fullResponse = loaded.second
+        fullRaw = loaded.third
+    }
+
+    // 抽屉内容可达几十万字符，必须自身可滚动（ModalBottomSheet 默认不可滚）。
+    Column(
+        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(record.id, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Text(
+            text = "${formatTime(record.startedAtMillis)} · ${statusLabel(record.status)} · HTTP ${record.httpStatus}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        DetailBlock(
+            "请求原文",
+            fullRequest ?: record.requestBody,
+            truncatedNote(fullRequest == null, record.requestBody),
+        ) { clipboard.setText(AnnotatedString(fullRequest ?: record.requestBody)) }
+        DetailBlock(
+            "响应原文",
+            fullResponse ?: record.responseBody,
+            truncatedNote(fullResponse == null, record.responseBody),
+        ) { clipboard.setText(AnnotatedString(fullResponse ?: record.responseBody)) }
+        if (record.rawResponse.isNotEmpty() || fullRaw != null) {
+            DetailBlock(
+                "返回原文（上游报文）",
+                fullRaw ?: record.rawResponse,
+                truncatedNote(fullRaw == null, record.rawResponse),
+            ) { clipboard.setText(AnnotatedString(fullRaw ?: record.rawResponse)) }
+        }
+        if (record.error.isNotEmpty()) DetailBlock("错误", record.error, null) { clipboard.setText(AnnotatedString(record.error)) }
+    }
+}
+
+/**
+ * 字段是否被截断的说明行：溢出文件缺失时，长度超过摘要阈值即视为「存储中为摘要」。
+ */
+private fun truncatedNote(fullMissing: Boolean, summary: String): String? = when {
+    !fullMissing -> null
+    summary.length >= dev.aigw.core.usage.CallLogStore.MAX_SUMMARY_CHARS ->
+        "内容较长，仅保留前 ${dev.aigw.core.usage.CallLogStore.MAX_SUMMARY_CHARS} 字符摘要（完整原文已被清理或本次未启用完整保存）"
+    else -> null
+}
+
+/**
+ * 排查诊断：详细日志开关 + 一键导出诊断包（运行日志/错误现场/账号状态，不含密钥）。
+ */
+@Composable
+private fun DiagnosticsSettings(state: AppUiState, viewModel: AppViewModel) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    SectionCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("详细日志", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = "记录每次调用的请求、转发、发送与返回原文，用于排查 503 等问题；关闭后立即生效",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = state.settings.verboseLogging,
+                onCheckedChange = {
+                    viewModel.updateSettings(state.settings.copy(verboseLogging = it))
+                },
+            )
+        }
+        var diagCopied by remember { mutableStateOf(false) }
+        ChoiceChip(if (diagCopied) "已复制诊断包" else "导出诊断包", diagCopied) {
+            clipboard.setText(AnnotatedString(viewModel.diagnosticsJson()))
+            diagCopied = true
+            android.widget.Toast.makeText(context, "诊断包已复制到剪贴板（不含密钥）", android.widget.Toast.LENGTH_SHORT).show()
+        }
+        Text(
+            text = "诊断包含运行日志、错误现场与账号状态；apiKey 与账号凭证已剔除，可放心发给排查方。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * 调用记录的参数设置：归档开关、保留天数、清空。
+ */
+@Composable
+private fun CallLogSettings(state: AppUiState, viewModel: AppViewModel) {
+    SectionCard {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("记录调用", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = "保存每次调用的请求/响应原文与用量；关闭后不再新增（已存记录不受影响）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = state.settings.callLoggingEnabled,
+                    onCheckedChange = {
+                        viewModel.updateSettings(state.settings.copy(callLoggingEnabled = it))
+                    },
+                )
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+            Text(
+                text = "服务运行时每日自动清理超过该天数的记录，当前 ${state.settings.logRetentionDays} 天。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            RetentionField(state.settings.logRetentionDays) { viewModel.setLogRetentionDays(it) }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+            Text("清空记录", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = "删除本机保存的全部调用记录（含完整原文），不可恢复。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlineActionButton("清空调用记录") { viewModel.clearCalls() }
+        }
+    }
+}
+
+/**
+ * 保留天数输入。
+ *
+ * 失焦或回车才提交，避免边输入边保存把「30」中间的「3」当成 30 天。越界值由 core 夹回，
+ * 这里只做即时提示。
+ */
+@Composable
+fun RetentionField(current: Int, onCommit: (Int) -> Unit) {
+    var text by remember(current) { mutableStateOf(current.toString()) }
+    val parsed = text.toIntOrNull()
+    val valid = parsed != null && parsed in GatewaySettings.MIN_RETENTION_DAYS..GatewaySettings.MAX_RETENTION_DAYS
+    val changed = parsed != null && parsed != current
+
+    Text(
+        text = "保留天数（${GatewaySettings.MIN_RETENTION_DAYS}-${GatewaySettings.MAX_RETENTION_DAYS}）",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    OutlinedTextField(
+        value = text,
+        onValueChange = { input -> text = input.filter(Char::isDigit).take(4) },
+        modifier = Modifier.fillMaxWidth(),
+        singleLine = true,
+        isError = text.isNotEmpty() && !valid,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        supportingText = {
+            when {
+                text.isEmpty() -> Text("不能为空")
+                !valid -> Text("需在 ${GatewaySettings.MIN_RETENTION_DAYS}-${GatewaySettings.MAX_RETENTION_DAYS} 之间")
+            }
+        },
+    )
+    if (changed) {
+        OutlineActionButton("保存保留天数") { onCommit(parsed) }
+    }
+}
+
+/**
+ * 请求日志的参数设置：每项参数一个控件，展开后直接调整，不折叠到弹窗里。
+ * 只改「请求日志」相关项；调用记录的归档开关与保留天数在「调用记录」标签的设置面板里。
+ */
+@Composable
+private fun RequestLogSettings(state: AppUiState, viewModel: AppViewModel) {
+    SectionCard {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("日志容量", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = "环形缓冲最多保留的日志条数，超出后自动丢弃最旧一条；调大占用更多内存与存储。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            LogCapacityField(state.settings.requestLogCapacity) {
+                viewModel.updateSettings(state.settings.copy(requestLogCapacity = it))
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+            Text("清空日志", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = "删除当前全部请求日志，容量等设置不受影响。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlineActionButton("清空请求日志") { viewModel.clearLogs() }
+        }
+    }
+}
+
+@Composable
+private fun DetailBlock(title: String, body: String, note: String?, onCopy: () -> Unit) {
+    // 大文本折叠：全文可达 512K 字符，一次性组合进 Text 会让抽屉首帧明显卡顿；
+    // 默认只渲染预览，点「展开全文」后再渲染完整内容。
+    var expanded by remember(body) { mutableStateOf(body.length <= PREVIEW_CHARS) }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            if (!expanded && body.length > PREVIEW_CHARS) {
+                Text(
+                    text = "展开全文",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .clickable { expanded = true }
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                )
+            }
+            Text(
+                text = "复制",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .clickable(onClick = onCopy)
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
+        if (note != null) {
+            Text(
+                text = note,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        val visible = if (expanded) body else body.take(PREVIEW_CHARS) + "\n…（点击「展开全文」查看剩余部分）"
+        Text(
+            text = visible.ifEmpty { "（空）" },
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(MaterialTheme.shapes.medium)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(12.dp),
+        )
+    }
+}
+
+private const val PREVIEW_CHARS = 2_000
+
+private fun statusLabel(status: CallStatus): String = when (status) {
+    CallStatus.SUCCESS -> "成功"
+    CallStatus.FAILED -> "失败"
+    CallStatus.ABORTED -> "中断"
+}
+
+@Composable
+private fun levelColor(level: String): Color = when (level.uppercase()) {
+    "WARN" -> Color(0xFFC97F0A)
+    "ERROR" -> MaterialTheme.colorScheme.error
+    else -> MaterialTheme.colorScheme.onSurface
+}
+
+/** 日志容量输入：失焦/回车不适用（按钮提交），越界由 core 夹回。 */
+@Composable
+private fun LogCapacityField(current: Int, onCommit: (Int) -> Unit) {
+    var text by remember(current) { mutableStateOf(current.toString()) }
+    val parsed = text.toIntOrNull()
+    val valid = parsed != null &&
+        parsed in dev.aigw.core.gateway.GatewaySettings.MIN_REQUEST_LOG_CAPACITY..
+        dev.aigw.core.gateway.GatewaySettings.MAX_REQUEST_LOG_CAPACITY
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = text,
+            onValueChange = { input -> text = input.filter(Char::isDigit).take(4) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("请求日志容量（${dev.aigw.core.gateway.GatewaySettings.MIN_REQUEST_LOG_CAPACITY}-${dev.aigw.core.gateway.GatewaySettings.MAX_REQUEST_LOG_CAPACITY} 条）") },
+            isError = text.isNotEmpty() && !valid,
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+        )
+        if (parsed != null && valid && parsed != current) {
+            OutlineActionButton("保存容量") { onCommit(parsed) }
+        }
+    }
+}
+
+@Composable
+private fun statusColor(status: CallStatus): Color = when (status) {
+    CallStatus.SUCCESS -> MaterialTheme.colorScheme.tertiary
+    CallStatus.FAILED -> MaterialTheme.colorScheme.error
+    CallStatus.ABORTED -> Color(0xFFC97F0A)
+}
+
+private fun formatTime(millis: Long): String =
+    SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(Date(millis))
