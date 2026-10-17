@@ -43,11 +43,11 @@ import kotlin.math.roundToLong
  * 由 [OpenAiGemini] 做双向转换。
  */
 class AntigravityProvider(
-    private val hooks: ProviderHooks = ProviderHooks(),
-    private val nowMillis: () -> Long = System::currentTimeMillis,
-    private val apiBase: String = API_BASE,
-    private val quotaBase: String = QUOTA_BASE,
-    private val tokenEndpoint: String = TOKEN_ENDPOINT,
+    internal val hooks: ProviderHooks = ProviderHooks(),
+    internal val nowMillis: () -> Long = System::currentTimeMillis,
+    internal val apiBase: String = API_BASE,
+    internal val quotaBase: String = QUOTA_BASE,
+    internal val tokenEndpoint: String = TOKEN_ENDPOINT,
 ) : Provider, LoopbackOAuthSupport {
 
     override val id: String = ID
@@ -411,98 +411,6 @@ class AntigravityProvider(
 
     // ------------------------------------------------------------------ HTTP
 
-    private fun exchangeCodeForTokens(code: String): Tokens {
-        val form = mapOf(
-            "code" to code,
-            "client_id" to CLIENT_ID,
-            "client_secret" to CLIENT_SECRET,
-            "redirect_uri" to redirectUri(),
-            "grant_type" to "authorization_code",
-        )
-        val (status, body) = postForm(tokenEndpoint, form)
-        if (status !in 200..299) throw IllegalStateException("换取 token 失败（HTTP $status）：${body.take(200)}")
-        val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull()
-            ?: throw IllegalStateException("token 响应不是合法 JSON")
-        val access = obj.get("access_token")?.asString.orEmpty()
-        if (access.isEmpty()) throw IllegalStateException("token 响应缺少 access_token")
-        val expiresIn = obj.get("expires_in")?.asLong ?: 3600L
-        return Tokens(
-            accessToken = access,
-            refreshToken = obj.get("refresh_token")?.asString.orEmpty(),
-            expiresAt = nowMillis() / 1000 + expiresIn,
-        )
-    }
-
-    private fun refreshAccessToken(credential: Credential): Credential? {
-        if (credential.refreshToken.isEmpty()) return null
-        val form = mapOf(
-            "client_id" to CLIENT_ID,
-            "client_secret" to CLIENT_SECRET,
-            "refresh_token" to credential.refreshToken,
-            "grant_type" to "refresh_token",
-        )
-        val (status, body) = try {
-            postForm(tokenEndpoint, form)
-        } catch (e: Exception) {
-            hooks.onLog("Antigravity 刷新 Token 网络异常：${e.message}")
-            return null
-        }
-        if (status !in 200..299) {
-            hooks.onLog("Antigravity 刷新 Token 失败（HTTP $status）：${body.take(160)}")
-            return null
-        }
-        val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return null
-        val access = obj.get("access_token")?.asString.orEmpty()
-        if (access.isEmpty()) return null
-        val expiresIn = obj.get("expires_in")?.asLong ?: 3600L
-        // Google 可能轮换 refresh_token（此时旧值作废），不回存会导致下次刷新 invalid_grant
-        val nextRefresh = obj.get("refresh_token")?.asString?.takeIf { it.isNotEmpty() }
-        return credential.copy(
-            accessToken = access,
-            refreshToken = nextRefresh ?: credential.refreshToken,
-            expiresAt = nowMillis() / 1000 + expiresIn,
-        )
-    }
-
-    private fun fetchEmail(accessToken: String): String {
-        val (status, body) = try {
-            get("https://www.googleapis.com/oauth2/v2/userinfo?alt=json", accessToken)
-        } catch (_: Exception) {
-            return ""
-        }
-        if (status !in 200..299) return ""
-        return runCatching { JsonParser.parseString(body).asJsonObject.get("email")?.asString.orEmpty() }
-            .getOrDefault("")
-    }
-
-    /** `loadCodeAssist` 取 project id；字段名以响应为准，做宽容提取。 */
-    private fun fetchProjectId(accessToken: String): String {
-        val payload = JsonObject().apply {
-            add("metadata", JsonObject().apply {
-                addProperty("ideType", "IDE_UNSPECIFIED")
-                addProperty("platform", "PLATFORM_UNSPECIFIED")
-                addProperty("pluginType", "GEMINI")
-            })
-        }.toString()
-        val (status, body) = try {
-            postJson("$apiBase/$API_VERSION:loadCodeAssist", accessToken, payload)
-        } catch (_: Exception) {
-            return ""
-        }
-        if (status !in 200..299) return ""
-        val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return ""
-        for (key in listOf("cloudaicompanionProject", "project", "projectId")) {
-            obj.get(key)?.let { value ->
-                when {
-                    value.isJsonPrimitive -> value.asString.takeIf { it.isNotEmpty() }?.let { return it }
-                    value.isJsonObject -> value.asJsonObject.get("id")?.asString
-                        ?.takeIf { it.isNotEmpty() }?.let { return it }
-                }
-            }
-        }
-        return ""
-    }
-
     private fun open(url: String, accessToken: String, body: String?): HttpURLConnection {
         val headers = buildMap {
             put("Authorization", "Bearer $accessToken")
@@ -519,7 +427,7 @@ class AntigravityProvider(
         )
     }
 
-    private fun get(url: String, accessToken: String): Pair<Int, String> {
+    internal fun get(url: String, accessToken: String): Pair<Int, String> {
         val conn = open(url, accessToken, null)
         return try {
             conn.responseCode to HttpSupport.readBody(conn)
@@ -528,7 +436,7 @@ class AntigravityProvider(
         }
     }
 
-    private fun postJson(url: String, accessToken: String, body: String, connectTimeout: Int = CONNECT_TIMEOUT_MS, readTimeout: Int = READ_TIMEOUT_MS): Pair<Int, String> {
+    internal fun postJson(url: String, accessToken: String, body: String, connectTimeout: Int = CONNECT_TIMEOUT_MS, readTimeout: Int = READ_TIMEOUT_MS): Pair<Int, String> {
         val conn = HttpSupport.open(
             url = url,
             method = "POST",
@@ -548,7 +456,7 @@ class AntigravityProvider(
         }
     }
 
-    private fun postForm(url: String, form: Map<String, String>): Pair<Int, String> {
+    internal fun postForm(url: String, form: Map<String, String>): Pair<Int, String> {
         val encoded = form.entries.joinToString("&") { "${encode(it.key)}=${encode(it.value)}" }
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -604,7 +512,7 @@ class AntigravityProvider(
         return ProviderAccount(id, uid, nickname, secret)
     }
 
-    private fun redirectUri(): String = "http://localhost:$CALLBACK_PORT$CALLBACK_PATH"
+    internal fun redirectUri(): String = "http://localhost:$CALLBACK_PORT$CALLBACK_PATH"
 
     private fun extractMessage(body: String): String {
         if (body.isEmpty()) return ""
@@ -620,180 +528,13 @@ class AntigravityProvider(
         runCatching { JsonParser.parseString(body).asJsonObject.get("model")?.asString.orEmpty() }
             .getOrDefault("")
 
-    /** CLIProxyAPI 同款请求体：只要 ideType=ANTIGRAVITY，响应里带 paidTier 的积分明细。 */
-    private fun loadPaidCredits(accessToken: String): Pair<Int, String> {
-        val payload = JsonObject().apply {
-            add("metadata", JsonObject().apply { addProperty("ideType", "ANTIGRAVITY") })
-        }.toString()
-        return postJson("$apiBase/$API_VERSION:loadCodeAssist", accessToken, payload)
-    }
-
-    /**
-     * 模型组配额（桌面 App 展示的「Weekly Limit / Five Hour Limit」）。必须走 daily- 前缀域名：
-     * 非前缀域名对 Gemini 组永远返回 remainingFraction=1（错误数据，见 agy 语言服务器日志）。
-     */
-    private fun loadQuotaSummary(accessToken: String, projectId: String): Pair<Int, String> {
-        val payload = if (projectId.isEmpty()) {
-            "{}"
-        } else {
-            JsonObject().apply { addProperty("project", projectId) }.toString()
-        }
-        return postJson("$quotaBase/$API_VERSION:retrieveUserQuotaSummary", accessToken, payload)
-    }
-
-    /** 无积分可显示时，账号卡片余额取最紧窗口的剩余百分比，detail 标注订阅层级。 */
-    private fun quotaCreditInfo(credential: Credential, tierLabel: String): CreditInfo {
-        val (status, body) = try {
-            loadQuotaSummary(credential.accessToken, credential.projectId)
-        } catch (e: Exception) {
-            return CreditInfo(0, known = false, detail = "$tierLabel · 查询配额失败：${e.message}")
-        }
-        if (status == 401 || status == 403) {
-            return CreditInfo(0, known = false, detail = "登录状态已失效，需要重新登录")
-        }
-        if (status !in 200..299) {
-            return CreditInfo(0, known = false, detail = "$tierLabel · 查询配额失败（HTTP $status）：${body.take(200)}")
-        }
-        val buckets = parseQuotaBuckets(body)
-        if (buckets.isEmpty()) {
-            return CreditInfo(0, known = false, detail = "$tierLabel · 上游没有返回模型组配额：${body.take(200)}")
-        }
-        val tightest = buckets.minBy { it.remainingPct }
-        val pct = tightest.remainingPct.roundToLong()
-        val windows = buckets.joinToString(" · ") { bucket ->
-            "${bucket.groupName} ${bucket.windowName} ${bucket.remainingPct.roundToLong()}%"
-        }
-        return CreditInfo(
-            pct,
-            known = true,
-            detail = "$tierLabel · 组配额剩余 $pct%（最紧：${tightest.groupName} ${tightest.windowName}）；全部窗口：$windows",
-        )
-    }
-
-    private fun quotaPacks(body: String, tierLabel: String): List<QuotaPack> =
-        parseQuotaBuckets(body).map { bucket ->
-            QuotaPack(
-                name = bucket.groupName,
-                group = "$tierLabel · ${bucket.windowName}",
-                limit = 100,
-                used = bucket.usedPct.roundToLong(),
-                remain = bucket.remainingPct.roundToLong(),
-                expireAt = bucket.resetAtSeconds,
-            )
-        }
-
-    /** `loadCodeAssist` 解析结果：订阅层级 + Google One 积分（可能为空）。 */
-    private data class PaidAssist(
-        val tierLabel: String,
-        val credits: Long?,
-        val creditsDetail: String,
-    )
-
-    /**
-     * 解析订阅层级与积分：`paidTier` 是 Google One 订阅（Gemini 会员 = Google AI Pro），
-     * 缺失时用 `currentTier`（consumer 恒为 free-tier）。积分只认 GOOGLE_ONE_AI 条目，
-     * 字符串/数字都按浮点解析；余额低于 minimumCreditAmountForUsage 记为不可用。
-     */
-    private fun parsePaidAssist(body: String): PaidAssist? {
-        val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return null
-        val tierLabel = tierLabelOf(obj)
-        val credits = obj.objOrNull("paidTier")
-            ?.get("availableCredits")?.takeIf { it.isJsonArray }
-            ?.asJsonArray
-            ?.firstNotNullOfOrNull { element ->
-                val credit = element.takeIf { it.isJsonObject }?.asJsonObject ?: return@firstNotNullOfOrNull null
-                if (!credit.get("creditType")?.asString.orEmpty().equals("GOOGLE_ONE_AI", ignoreCase = true)) {
-                    return@firstNotNullOfOrNull null
-                }
-                val amount = runCatching { credit.get("creditAmount")?.asString?.trim()?.toFloat() }.getOrNull()
-                    ?: return@firstNotNullOfOrNull null
-                val minimum = runCatching { credit.get("minimumCreditAmountForUsage")?.asString?.trim()?.toFloat() }
-                    .getOrNull() ?: 0f
-                if (amount >= minimum) {
-                    amount.toLong().coerceAtLeast(0) to "Google One AI 积分"
-                } else {
-                    0L to "Google One AI 积分（余额 $amount 已低于可用下限 $minimum）"
-                }
-            }
-        return PaidAssist(tierLabel, credits?.first, credits?.second ?: "")
-    }
-
-    /** 订阅层级展示名（Cli-Proxy-API-Management-Center #318 同款映射）。 */
-    private fun tierLabelOf(obj: JsonObject): String {
-        val paidTier = obj.objOrNull("paidTier")
-        val paidId = paidTier?.get("id")?.asString?.trim().orEmpty()
-        val paidName = paidTier?.get("name")?.asString?.trim().orEmpty()
-        if (paidId.isNotEmpty() || paidName.isNotEmpty()) {
-            return when (paidId) {
-                "g1-pro-tier" -> "Google AI Pro"
-                "g1-ultra-tier" -> "Google AI Ultra"
-                "g1-ultra-lite-tier" -> "Google AI Ultra Lite"
-                else -> paidName.ifEmpty { paidId }
-            }
-        }
-        val currentId = obj.objOrNull("currentTier")?.get("id")?.asString?.trim().orEmpty()
-        val currentName = obj.objOrNull("currentTier")?.get("name")?.asString?.trim().orEmpty()
-        return when {
-            currentId.equals("free-tier", ignoreCase = true) -> "免费版"
-            currentId.isNotEmpty() -> currentName.ifEmpty { currentId }
-            else -> "订阅未知"
-        }
-    }
-
-    private data class QuotaBucket(
-        val groupName: String,
-        val windowName: String,
-        val remainingPct: Double,
-        val usedPct: Double,
-        val resetAtSeconds: Long,
-    )
-
-    /**
-     * 解析 `retrieveUserQuotaSummary`：`groups[]` 每组（如 Gemini Models）带若干窗口
-     * bucket（周/5 小时），`remainingFraction` 0-1（1 = 未用），`resetTime` ISO 时间。
-     */
-    private fun parseQuotaBuckets(body: String): List<QuotaBucket> {
-        val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return emptyList()
-        val groups = obj.get("groups")?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
-        val result = mutableListOf<QuotaBucket>()
-        for (groupElement in groups.asJsonArray) {
-            val group = groupElement.takeIf { it.isJsonObject }?.asJsonObject ?: continue
-            val groupName = group.get("displayName")?.asString?.takeIf { it.isNotEmpty() } ?: "Models"
-            val buckets = group.get("buckets")?.takeIf { it.isJsonArray }?.asJsonArray ?: continue
-            for (bucketElement in buckets.asJsonArray) {
-                val bucket = bucketElement.takeIf { it.isJsonObject }?.asJsonObject ?: continue
-                val fraction = runCatching { bucket.get("remainingFraction")?.asString?.trim()?.toDouble() }
-                    .getOrNull() ?: continue
-                val windowName = bucket.get("displayName")?.asString?.takeIf { it.isNotEmpty() }
-                    ?: bucket.get("bucketId")?.asString?.takeIf { it.isNotEmpty() }
-                    ?: "Limit"
-                val bounded = fraction.coerceIn(0.0, 1.0)
-                result += QuotaBucket(
-                    groupName = groupName,
-                    windowName = windowName,
-                    remainingPct = bounded * 100.0,
-                    usedPct = (1.0 - bounded) * 100.0,
-                    resetAtSeconds = parseIsoSeconds(bucket.get("resetTime")?.asString),
-                )
-            }
-        }
-        return result
-    }
-
-    private fun parseIsoSeconds(value: String?): Long {
-        if (value.isNullOrBlank()) return 0L
-        return runCatching { OffsetDateTime.parse(value.trim()).toEpochSecond() }.getOrDefault(0L)
-    }
-
     private fun isStreaming(body: String): Boolean =
         runCatching { JsonParser.parseString(body).asJsonObject.get("stream")?.asBoolean ?: false }
             .getOrDefault(false)
 
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
-    private data class Tokens(val accessToken: String, val refreshToken: String, val expiresAt: Long)
-
-    private data class Credential(
+    internal data class Credential(
         val accessToken: String,
         val refreshToken: String,
         val expiresAt: Long,
